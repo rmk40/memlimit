@@ -1,0 +1,12 @@
+# Build artifacts
+memlimit
+memlimit_asan
+test_alloc
+*.o
+*.dSYM/
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store

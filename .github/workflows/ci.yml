@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (clang)
+          - os: ubuntu-latest
+            name: Ubuntu (gcc)
+          - os: ubuntu-latest
+            name: Ubuntu (clang)
+            cc: clang
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make CC="${CC:-cc}"
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Test
+        run: make test
+
+      - name: Build with AddressSanitizer
+        run: |
+          make clean
+          ${CC:-cc} -std=c11 -Wall -Wextra -Werror -fsanitize=address -g -o memlimit_asan memlimit.c
+          ./memlimit_asan 1G -- true
+          echo "ASan: clean"
+        env:
+          CC: ${{ matrix.cc }}
