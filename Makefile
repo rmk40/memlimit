@@ -55,22 +55,23 @@ endif
 	         || shasum -a 256 /tmp/memlimit-src.tar.gz); \
 	SHA256=$${SHA256%% *}; \
 	rm -f /tmp/memlimit-src.tar.gz; \
-	printf 'class Memlimit < Formula\n\
-	  desc "Zero-dependency memory limiter using phys_footprint (macOS) and PSS (Linux)"\n\
-	  homepage "https://github.com/rmk40/memlimit"\n\
-	  url "https://github.com/rmk40/memlimit/archive/refs/tags/v%s.tar.gz"\n\
-	  sha256 "%s"\n\
-	  license "MIT"\n\
-	\n\
-	  def install\n\
-	    system "make", "install", "PREFIX=#{prefix}"\n\
-	  end\n\
-	\n\
-	  test do\n\
-	    assert_match "memlimit #{version}", shell_output("#{bin}/memlimit --version")\n\
-	    system bin/"memlimit", "1G", "--", "true"\n\
-	  end\n\
-	end\n' "$(VERSION)" "$$SHA256" > /tmp/memlimit.rb; \
+	printf '%s\n' \
+	  'class Memlimit < Formula' \
+	  '  desc "Zero-dependency memory limiter using phys_footprint (macOS) and PSS (Linux)"' \
+	  '  homepage "https://github.com/rmk40/memlimit"' \
+	  '  url "https://github.com/rmk40/memlimit/archive/refs/tags/v$(VERSION).tar.gz"' \
+	  "  sha256 \"$$SHA256\"" \
+	  '  license "MIT"' \
+	  '' \
+	  '  def install' \
+	  '    system "make", "install", "PREFIX=#{prefix}"' \
+	  '  end' \
+	  '' \
+	  '  test do' \
+	  '    assert_match "memlimit #{version}", shell_output("#{bin}/memlimit --version")' \
+	  '    system bin/"memlimit", "1G", "--", "true"' \
+	  '  end' \
+	  'end' > /tmp/memlimit.rb; \
 	FORMULA_SHA=$$(gh api "repos/$(TAP_REPO)/contents/$(FORMULA)" --jq '.sha'); \
 	CONTENT=$$(base64 < /tmp/memlimit.rb | tr -d '\n'); \
 	rm -f /tmp/memlimit.rb; \
