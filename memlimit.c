@@ -46,7 +46,7 @@
 /* Constants                                                                  */
 /* ------------------------------------------------------------------------- */
 
-#define VERSION           "1.0.0"
+#define VERSION           "1.1.0"
 #define POLL_INTERVAL_US  250000   /* 250 ms */
 #define REAP_POLL_US      100000   /* 100 ms */
 #define MEASURE_FAIL_POLLS 4
