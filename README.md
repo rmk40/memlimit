@@ -50,6 +50,20 @@ memlimit -v1 500M -- python3 train.py
 memlimit --grace 2 2G -- node server.js
 ```
 
+### Quick Start
+
+Install with Homebrew:
+
+```bash
+brew install rmk40/tap/memlimit
+```
+
+Then run:
+
+```bash
+memlimit 8G -- some-command --arg
+```
+
 ### Options
 
 | Flag                     | Default | Description                                                           |
@@ -121,6 +135,14 @@ No external dependencies. Uses only system headers and libc.
 
 ## Install
 
+Homebrew:
+
+```bash
+brew install rmk40/tap/memlimit
+```
+
+From source:
+
 ```
 sudo make install
 ```
@@ -167,8 +189,8 @@ sudo make uninstall
 
 ### Linux-Specific
 
-- **Kernel 4.14+ required** for `/proc/PID/smaps_rollup`. On older kernels
-  memory reads return 0 and the limit won't be enforced.
+- **Kernel 4.14+ recommended** for `/proc/PID/smaps_rollup`. On older kernels,
+  `memlimit` falls back to `/proc/PID/smaps` for PSS.
 - **`ptrace_scope` may restrict access.** With `kernel.yama.ptrace_scope >= 1`,
   reading `smaps_rollup` for another user's processes requires
   `CAP_SYS_PTRACE`. Same-user reads work fine under the default setting.
