@@ -5,8 +5,8 @@ MEMLIMIT_CFLAGS = -std=c11 -Wall -Wextra -Werror -Wpedantic \
                   -fstack-protector-strong -D_FORTIFY_SOURCE=2
 CFLAGS   ?= -O2
 LDFLAGS  ?=
-PREFIX    = /usr/local
-BINDIR    = $(PREFIX)/bin
+PREFIX   ?= /usr/local
+BINDIR   ?= $(PREFIX)/bin
 
 TARGET    = memlimit
 SRC       = memlimit.c
@@ -23,7 +23,7 @@ $(TARGET): $(SRC)
 # --- Test ---
 
 test_alloc: test_alloc.c
-	$(CC) -O2 -o $@ $<
+	$(CC) -Wall -Wextra -Werror $(CFLAGS) -o $@ $<
 
 test: $(TARGET) test_alloc
 	@./test.sh ./$(TARGET)
@@ -49,12 +49,13 @@ ifndef VERSION
 	$(error VERSION is required (e.g. make update-tap VERSION=1.0.1))
 endif
 	@set -e; \
+	TMPDIR=$$(mktemp -d); \
+	trap 'rm -rf "$$TMPDIR"' EXIT; \
 	TARBALL_URL="https://github.com/rmk40/memlimit/archive/refs/tags/v$(VERSION).tar.gz"; \
-	curl -sfL "$$TARBALL_URL" -o /tmp/memlimit-src.tar.gz; \
-	SHA256=$$(sha256sum /tmp/memlimit-src.tar.gz 2>/dev/null \
-	         || shasum -a 256 /tmp/memlimit-src.tar.gz); \
+	curl -sfL "$$TARBALL_URL" -o "$$TMPDIR/src.tar.gz"; \
+	SHA256=$$(sha256sum "$$TMPDIR/src.tar.gz" 2>/dev/null \
+	         || shasum -a 256 "$$TMPDIR/src.tar.gz"); \
 	SHA256=$${SHA256%% *}; \
-	rm -f /tmp/memlimit-src.tar.gz; \
 	printf '%s\n' \
 	  'class Memlimit < Formula' \
 	  '  desc "Zero-dependency memory limiter using phys_footprint (macOS) and PSS (Linux)"' \
@@ -71,10 +72,9 @@ endif
 	  '    assert_match "memlimit #{version}", shell_output("#{bin}/memlimit --version")' \
 	  '    system bin/"memlimit", "1G", "--", "true"' \
 	  '  end' \
-	  'end' > /tmp/memlimit.rb; \
+	  'end' > "$$TMPDIR/memlimit.rb"; \
 	FORMULA_SHA=$$(gh api "repos/$(TAP_REPO)/contents/$(FORMULA)" --jq '.sha'); \
-	CONTENT=$$(base64 < /tmp/memlimit.rb | tr -d '\n'); \
-	rm -f /tmp/memlimit.rb; \
+	CONTENT=$$(base64 < "$$TMPDIR/memlimit.rb" | tr -d '\n'); \
 	gh api "repos/$(TAP_REPO)/contents/$(FORMULA)" \
 	  --method PUT \
 	  --field message="Update memlimit to $(VERSION)" \
@@ -85,4 +85,4 @@ endif
 # --- Clean ---
 
 clean:
-	rm -f $(TARGET) test_alloc
+	rm -f $(TARGET) memlimit_asan test_alloc

@@ -11,13 +11,14 @@
  * Copyright (c) 2026 — MIT License
  */
 
-#if !defined(__APPLE__) && !defined(__linux__)
-#error "memlimit requires macOS or Linux"
-#endif
-
-/* Ensure POSIX APIs (posix_spawn, sigaction, getpgid, nanosleep) on glibc. */
+/* Ensure POSIX APIs (posix_spawn, sigaction, getpgid, nanosleep) on glibc.
+ * Must precede all system header includes. */
 #if defined(__linux__)
 #define _POSIX_C_SOURCE 200809L
+#endif
+
+#if !defined(__APPLE__) && !defined(__linux__)
+#error "memlimit requires macOS or Linux"
 #endif
 
 #include <errno.h>
@@ -49,6 +50,9 @@
 #define VERSION           "1.1.1"
 #define POLL_INTERVAL_US  250000   /* 250 ms */
 #define REAP_POLL_US      100000   /* 100 ms */
+#define REAP_POLLS_PER_SEC (1000000 / REAP_POLL_US)
+_Static_assert(1000000 % REAP_POLL_US == 0,
+               "REAP_POLL_US must evenly divide 1000000");
 #define MEASURE_FAIL_POLLS 4
 #define PARTIAL_FAIL_POLLS 20
 #define DEFAULT_VERBOSE_SEC 5
@@ -116,7 +120,7 @@ static bool parse_size(const char *str, uint64_t *out)
         return false;
 
     *out = (uint64_t)val * multiplier;
-    return *out > 0;
+    return *out > 0;   /* zero is not a valid memory limit */
 }
 
 /*
@@ -158,13 +162,13 @@ static pid_t waitpid_noeintr(pid_t pid, int *status, int options)
     return ret;
 }
 
+/*
+ * kill(2) is not interruptible by signals per POSIX, but we wrap it for
+ * consistency with the other _noeintr helpers and defensive robustness.
+ */
 static int kill_noeintr(pid_t pid, int sig)
 {
-    int ret;
-    do {
-        ret = kill(pid, sig);
-    } while (ret == -1 && errno == EINTR);
-    return ret;
+    return kill(pid, sig);
 }
 
 /*
@@ -270,6 +274,8 @@ static uint64_t get_group_memory(pid_t pgid, int *nprocs, int *nmeasured,
         *nmeasured = 0;
     if (backend_ok != NULL)
         *backend_ok = true;
+    if (pgid <= 0)
+        return 0;
 
     int count = proc_listallpids(NULL, 0);
     if (count <= 0) {
@@ -321,8 +327,14 @@ static uint64_t get_group_memory(pid_t pgid, int *nprocs, int *nmeasured,
 
         procs++;
         uint64_t mem = 0;
-        if (!get_pid_memory(pids[i], &mem))
+        if (!get_pid_memory(pids[i], &mem)) {
+            /* If the process exited between enumeration and measurement,
+             * don't count it at all.  For other failures (EACCES, transient
+             * errors), keep it counted so partial-accounting detection works. */
+            if (kill(pids[i], 0) == -1 && errno == ESRCH)
+                procs--;
             continue;
+        }
 
         measured++;
         if (UINT64_MAX - total < mem) {
@@ -447,6 +459,8 @@ static uint64_t get_group_memory(pid_t pgid, int *nprocs, int *nmeasured,
         *nmeasured = 0;
     if (backend_ok != NULL)
         *backend_ok = true;
+    if (pgid <= 0)
+        return 0;
 
     DIR *proc_dir = opendir("/proc");
     if (proc_dir == NULL) {
@@ -488,8 +502,14 @@ static uint64_t get_group_memory(pid_t pgid, int *nprocs, int *nmeasured,
 
         procs++;
         uint64_t mem = 0;
-        if (!get_pid_memory(pid, &mem))
+        if (!get_pid_memory(pid, &mem)) {
+            /* If the process exited between enumeration and measurement,
+             * don't count it at all.  For other failures (EACCES, transient
+             * errors), keep it counted so partial-accounting detection works. */
+            if (kill(pid, 0) == -1 && errno == ESRCH)
+                procs--;
             continue;
+        }
 
         measured++;
         if (UINT64_MAX - total < mem) {
@@ -559,8 +579,8 @@ static bool kill_process_group(pid_t pgid, int grace_sec)
         return false;
     }
 
-    /* Poll for group disappearance over the grace period (100 ms intervals). */
-    for (int i = 0; i < grace_sec * 10; i++) {
+    /* Poll for group disappearance over the grace period. */
+    for (int i = 0; i < grace_sec * REAP_POLLS_PER_SEC; i++) {
         if (!process_group_exists(pgid))
             return true;
         sleep_for_us(REAP_POLL_US);
@@ -579,13 +599,60 @@ static bool kill_process_group(pid_t pgid, int grace_sec)
         return false;
     }
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < REAP_POLLS_PER_SEC; i++) {
         if (!process_group_exists(pgid))
             return true;
         sleep_for_us(REAP_POLL_US);
     }
 
     return !process_group_exists(pgid);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Kill-and-reap helper                                                       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Kill the child's process group, reap the direct child, and update the
+ * shared exit-tracking state.  Used by the monitor loop when it needs to
+ * terminate the group (accounting failure, limit exceeded, etc.).
+ *
+ * Returns true if the process group was successfully killed and the child
+ * was reaped.
+ */
+static bool kill_and_reap(pid_t child_pid, int grace_sec,
+                          bool *child_reaped, int *child_status,
+                          bool *child_status_valid, const char *reason)
+{
+    bool ok = kill_process_group(child_pid, grace_sec);
+
+    /* Reap the direct child before checking group liveness — a zombie
+     * child keeps the process group appearing alive until reaped. */
+    if (!*child_reaped) {
+        bool got_status = false;
+        if (!wait_for_child_exit(child_pid, child_status, &got_status,
+                                  (grace_sec + 2) * 1000)) {
+            fprintf(stderr,
+                    "memlimit: error: timed out waiting for child "
+                    "exit after %s\n", reason);
+            ok = false;
+        } else {
+            *child_reaped = true;
+            *child_status_valid = got_status;
+        }
+    }
+
+    /* Re-check after reaping: the group may be gone now. */
+    if (!ok && !process_group_exists(child_pid))
+        ok = true;
+
+    if (!ok) {
+        fprintf(stderr,
+                "memlimit: error: failed to terminate process group "
+                "after %s\n", reason);
+    }
+
+    return ok;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -615,9 +682,10 @@ static void print_usage(const char *progname)
         "  128+N    Child killed by signal N\n"
         "  %d      Command found but not executable / spawn failed\n"
         "  %d      Command not found\n"
-        "  %d        Usage error\n",
+        "  %d        Usage error\n"
+        "  %d        Internal error\n",
         progname, DEFAULT_VERBOSE_SEC, DEFAULT_GRACE_SEC, EXIT_OOM,
-        EXIT_NOT_EXEC, EXIT_NOT_FOUND, EXIT_USAGE);
+        EXIT_NOT_EXEC, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_INTERNAL);
 }
 
 static void print_version(void)
@@ -828,6 +896,8 @@ int main(int argc, char *argv[])
                 cmd_argv[0], strerror(spawn_err));
         if (spawn_err == ENOENT)
             return EXIT_NOT_FOUND;
+        if (spawn_err == EACCES)
+            return EXIT_NOT_EXEC;
         return EXIT_NOT_EXEC;
     }
 
@@ -888,36 +958,34 @@ int main(int argc, char *argv[])
         /* Check if memlimit itself received a signal */
         if (g_caught_signal) {
             forwarded_signal = g_caught_signal;
-            char sig_name[SIZE_BUF_LEN];
-            snprintf(sig_name, sizeof(sig_name), "signal %d", g_caught_signal);
-            fprintf(stderr, "memlimit: caught signal %s, forwarding to process group\n",
-                    sig_name);
+            g_caught_signal = 0;
+            fprintf(stderr,
+                    "memlimit: caught signal %d, forwarding to process group\n",
+                    forwarded_signal);
 
             bool cleanup_ok = true;
 
-            if (!send_signal_to_group(child_pid, g_caught_signal, sig_name))
+            char sig_name[SIZE_BUF_LEN];
+            snprintf(sig_name, sizeof(sig_name), "signal %d", forwarded_signal);
+            if (!send_signal_to_group(child_pid, forwarded_signal, sig_name))
                 cleanup_ok = false;
 
-            for (int i = 0; i < grace_sec * 10; i++) {
+            for (int i = 0; i < grace_sec * REAP_POLLS_PER_SEC; i++) {
                 if (!process_group_exists(child_pid))
                     break;
                 sleep_for_us(REAP_POLL_US);
             }
 
-            if (process_group_exists(child_pid) &&
-                !kill_process_group(child_pid, grace_sec)) {
-                cleanup_ok = false;
-            }
-
-            if (!child_reaped) {
-                bool got_status = false;
-                if (!wait_for_child_exit(child_pid, &child_status, &got_status,
-                                         (grace_sec + 2) * 1000)) {
-                    fprintf(stderr,
-                            "memlimit: error: timed out waiting for child exit "
-                            "after signal forwarding\n");
+            if (process_group_exists(child_pid)) {
+                if (!kill_and_reap(child_pid, grace_sec, &child_reaped,
+                                   &child_status, &child_status_valid,
+                                   "signal forwarding"))
                     cleanup_ok = false;
-                } else {
+            } else if (!child_reaped) {
+                /* Group is gone but we haven't reaped the direct child yet. */
+                bool got_status = false;
+                if (wait_for_child_exit(child_pid, &child_status, &got_status,
+                                        (grace_sec + 2) * 1000)) {
                     child_reaped = true;
                     child_status_valid = got_status;
                 }
@@ -933,11 +1001,11 @@ int main(int argc, char *argv[])
                     else if (WIFSIGNALED(child_status))
                         exit_code = 128 + WTERMSIG(child_status);
                     else
-                        exit_code = 128 + g_caught_signal;
+                        exit_code = 128 + forwarded_signal;
                 } else if (!cleanup_ok) {
                     exit_code = EXIT_INTERNAL;
                 } else {
-                    exit_code = 128 + g_caught_signal;
+                    exit_code = 128 + forwarded_signal;
                 }
             }
             break;
@@ -949,6 +1017,9 @@ int main(int argc, char *argv[])
                 child_reaped = true;
                 child_status_valid = true;
             } else if (w == -1 && errno == ECHILD) {
+                /* Another thread/handler already reaped the child.
+                 * child_status_valid stays false; exit code will fall
+                 * through to 0 unless overridden by signal/kill path. */
                 child_reaped = true;
             } else if (w == -1) {
                 perror("memlimit: waitpid");
@@ -977,8 +1048,7 @@ int main(int argc, char *argv[])
         if (nprocs > peak_nprocs)
             peak_nprocs = nprocs;
 
-        bool accounting_unavailable =
-            !backend_ok || nprocs == 0 || (nprocs > 0 && nmeasured == 0);
+        bool accounting_unavailable = !backend_ok || nmeasured == 0;
 
         if (accounting_unavailable) {
             unreadable_polls++;
@@ -996,25 +1066,14 @@ int main(int argc, char *argv[])
                         "memlimit: error: refusing to continue without memory "
                         "accounting; killing process group\n");
 
-                if (!kill_process_group(child_pid, grace_sec)) {
+                if (!kill_and_reap(child_pid, grace_sec, &child_reaped,
+                                   &child_status, &child_status_valid,
+                                   "accounting failure")
+                    && process_group_exists(child_pid)) {
                     fprintf(stderr,
-                            "memlimit: error: failed to terminate process group "
-                            "after accounting failure\n");
+                            "memlimit: error: process group still alive "
+                            "after accounting failure kill\n");
                 }
-
-                if (!child_reaped) {
-                    bool got_status = false;
-                    if (!wait_for_child_exit(child_pid, &child_status, &got_status,
-                                             (grace_sec + 2) * 1000)) {
-                        fprintf(stderr,
-                                "memlimit: error: timed out waiting for child "
-                                "exit after accounting failure\n");
-                    } else {
-                        child_reaped = true;
-                        child_status_valid = got_status;
-                    }
-                }
-
                 exit_code = EXIT_INTERNAL;
                 break;
             }
@@ -1037,26 +1096,14 @@ int main(int argc, char *argv[])
                             "memlimit: error: persistent partial accounting; "
                             "killing process group\n");
 
-                    if (!kill_process_group(child_pid, grace_sec)) {
+                    if (!kill_and_reap(child_pid, grace_sec, &child_reaped,
+                                       &child_status, &child_status_valid,
+                                       "partial accounting failure")
+                        && process_group_exists(child_pid)) {
                         fprintf(stderr,
-                                "memlimit: error: failed to terminate process "
-                                "group after partial accounting failure\n");
+                                "memlimit: error: process group still alive "
+                                "after partial accounting failure kill\n");
                     }
-
-                    if (!child_reaped) {
-                        bool got_status = false;
-                        if (!wait_for_child_exit(child_pid, &child_status,
-                                                 &got_status,
-                                                 (grace_sec + 2) * 1000)) {
-                            fprintf(stderr,
-                                    "memlimit: error: timed out waiting for "
-                                    "child exit after partial accounting failure\n");
-                        } else {
-                            child_reaped = true;
-                            child_status_valid = got_status;
-                        }
-                    }
-
                     exit_code = EXIT_INTERNAL;
                     break;
                 }
@@ -1066,10 +1113,11 @@ int main(int argc, char *argv[])
         }
 
         /* Verbose reporting */
-        if (verbose_polls > 0 && (poll_count % verbose_polls == 0)) {
+        if (verbose_polls > 0 && poll_count > 0
+            && (poll_count % verbose_polls == 0)) {
             char cur_str[SIZE_BUF_LEN];
             format_size(mem, cur_str, sizeof(cur_str));
-            double pct = (limit > 0) ? ((double)mem / (double)limit) * 100.0 : 0.0;
+            double pct = ((double)mem / (double)limit) * 100.0;
             fprintf(stderr, "memlimit: %s / %s (%.0f%%) [%d %s]\n",
                     cur_str, limit_str, pct,
                     nprocs, nprocs == 1 ? "proc" : "procs");
@@ -1083,29 +1131,11 @@ int main(int argc, char *argv[])
                     "memlimit: memory limit %s exceeded (group using %s), "
                     "killing process group\n", limit_str, mem_str);
 
-            bool kill_ok = kill_process_group(child_pid, grace_sec);
+            bool kill_ok = kill_and_reap(child_pid, grace_sec,
+                                          &child_reaped, &child_status,
+                                          &child_status_valid,
+                                          "limit exceeded");
             killed_by_limit = true;
-            if (!kill_ok) {
-                fprintf(stderr,
-                        "memlimit: warning: could not confirm full process "
-                        "group termination after limit exceeded\n");
-            }
-
-            /* Reap the child */
-            if (!child_reaped) {
-                bool got_status = false;
-                if (!wait_for_child_exit(child_pid, &child_status, &got_status,
-                                         (grace_sec + 2) * 1000)) {
-                    fprintf(stderr,
-                            "memlimit: error: timed out waiting for child "
-                            "exit after limit kill\n");
-                    exit_code = EXIT_INTERNAL;
-                    killed_by_limit = false;
-                } else {
-                    child_reaped = true;
-                    child_status_valid = got_status;
-                }
-            }
 
             if (!kill_ok && process_group_exists(child_pid)) {
                 fprintf(stderr,

@@ -92,6 +92,7 @@ Accepts an integer with an optional suffix (case-insensitive):
 | `126`   | Command found but not executable / spawn failed |
 | `127`   | Command not found                               |
 | `2`     | Usage error                                     |
+| `1`     | Internal error                                  |
 
 ## Platforms
 

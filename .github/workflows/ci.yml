@@ -32,13 +32,14 @@ jobs:
           CC: ${{ matrix.cc }}
 
       - name: Test
-        run: make test
+        run: make CC="${CC:-cc}" test
+        env:
+          CC: ${{ matrix.cc }}
 
-      - name: Build with AddressSanitizer
+      - name: Test with AddressSanitizer + UBSan
         run: |
           make clean
-          ${CC:-cc} -std=c11 -Wall -Wextra -Werror -fsanitize=address -g -o memlimit_asan memlimit.c
-          ./memlimit_asan 1G -- true
-          echo "ASan: clean"
+          make CC="${CC:-cc}" CFLAGS="-O2 -g -fsanitize=address,undefined -fno-omit-frame-pointer" test
+          echo "ASan+UBSan: clean"
         env:
           CC: ${{ matrix.cc }}

@@ -11,11 +11,20 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  validate:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Pin SHA for all subsequent jobs
+        id: pin
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Validate version
         run: |
@@ -31,26 +40,22 @@ jobs:
             exit 1
           fi
 
-      - name: Bump version, commit, and tag
+      - name: Bump version locally and verify build
         run: |
           VERSION="${{ github.event.inputs.version }}"
 
-          sed -i "s/#define VERSION.*/#define VERSION           \"$VERSION\"/" memlimit.c
+          sed -i'' -e "s/#define VERSION.*/#define VERSION           \"$VERSION\"/" memlimit.c
 
           grep -q "\"$VERSION\"" memlimit.c || {
             echo "::error::Failed to update VERSION in memlimit.c"
             exit 1
           }
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add memlimit.c
-          git commit -m "Bump version to $VERSION"
-          git tag "v$VERSION"
-          git push origin main "v$VERSION"
+          make test
+          ./memlimit --version | grep -q "$VERSION"
 
   test:
-    needs: release
+    needs: validate
     strategy:
       fail-fast: true
       matrix:
@@ -66,19 +71,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ github.event.inputs.version }}
+          ref: ${{ needs.validate.outputs.sha }}
 
-      - name: Build and test
-        run: make test
+      - name: Bump version and test
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          sed -i'' -e "s/#define VERSION.*/#define VERSION           \"$VERSION\"/" memlimit.c
+          make test
+          ./memlimit --version | grep -q "$VERSION"
 
-  publish:
-    needs: test
+  tag-and-publish:
+    needs: [validate, test]
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ github.event.inputs.version }}
+          ref: ${{ needs.validate.outputs.sha }}
+
+      - name: Bump version, commit, tag, and push
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+
+          # Checkout leaves detached HEAD; create a local main branch.
+          git checkout -B main
+
+          sed -i'' -e "s/#define VERSION.*/#define VERSION           \"$VERSION\"/" memlimit.c
+
+          grep -q "\"$VERSION\"" memlimit.c || {
+            echo "::error::Failed to update VERSION in memlimit.c"
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add memlimit.c
+          git commit -m "chore: bump version to $VERSION"
+          git tag "v$VERSION"
+          git push --atomic origin main "v$VERSION"
 
       - name: Create GitHub release
         run: |
